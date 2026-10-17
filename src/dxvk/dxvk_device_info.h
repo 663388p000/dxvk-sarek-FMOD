@@ -41,7 +41,6 @@ namespace dxvk {
     VkPhysicalDevice4444FormatsFeaturesEXT                    ext4444Formats;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT              extCustomBorderColor;
     VkPhysicalDeviceDepthClipEnableFeaturesEXT                extDepthClipEnable;
-    VkExternalMemoryAcquireUnmodifiedEXT extExternalMemoryAcquireUnmodified;
     VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT extDynamicRenderingUnusedAttachments;
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT           extExtendedDynamicState;
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT          extExtendedDynamicState2;
@@ -79,8 +78,10 @@ namespace dxvk {
   // NOTE: a handful of the requested extensions add no VkPhysicalDeviceFeatures2-
   // chainable struct at all (VK_KHR_pipeline_library, VK_EXT_pipeline_creation_feedback,
   // VK_EXT_queue_family_foreign, VK_EXT_global_priority, VK_EXT_image_drm_format_modifier,
-  // VK_KHR_swapchain_mutable_format, VK_KHR_incremental_present) - they only add
-  // create-info structs used at pipeline/queue/image/swapchain creation time, so
-  // there is nothing to add here for them; see dxvk_extensions.h for the full list.
+  // VK_KHR_swapchain_mutable_format, VK_KHR_incremental_present,
+  // VK_EXT_external_memory_acquire_unmodified) - they only add structs used at
+  // pipeline/queue/image/swapchain creation time or chained into barriers
+  // (VkExternalMemoryAcquireUnmodifiedEXT), so there is nothing to add here for
+  // them; see dxvk_extensions.h for the full list.
 
 }
