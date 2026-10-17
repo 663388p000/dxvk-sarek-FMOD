@@ -41,7 +41,7 @@ namespace dxvk {
     VkPhysicalDevice4444FormatsFeaturesEXT                    ext4444Formats;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT              extCustomBorderColor;
     VkPhysicalDeviceDepthClipEnableFeaturesEXT                extDepthClipEnable;
-    VkPhysicalDeviceExternalMemoryAcquireUnmodifiedFeaturesEXT extExternalMemoryAcquireUnmodified;
+    VkExternalMemoryAcquireUnmodifiedEXT extExternalMemoryAcquireUnmodified;
     VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT extDynamicRenderingUnusedAttachments;
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT           extExtendedDynamicState;
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT          extExtendedDynamicState2;
