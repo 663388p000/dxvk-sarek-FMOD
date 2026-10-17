@@ -236,20 +236,6 @@ namespace dxvk {
         externalMemoryHandleTypes[i] = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
     }
 
-#ifdef _WIN32
-    // Resolved once here rather than per-allocation. Used by
-    // tryAllocRaw() to validate/restrict the memory type index chosen
-    // for an *imported* Win32 handle against what the driver actually
-    // reports as valid for that specific handle (see the call site).
-    // This is separate from vulkanFunctions above: it's not something we
-    // hand to VMA, since imports always go through tryAllocRaw(), which
-    // bypasses VMA entirely and has no hook into it otherwise.
-    if (m_device->extensions().khrExternalMemoryWin32) {
-      m_pfnGetMemoryWin32HandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
-        m_vkd->sym("vkGetMemoryWin32HandlePropertiesKHR"));
-    }
-#endif
-
     /* Target 80% of a heap on UMA systems where system RAM and VRAM are
      * the same pool and we must leave room for the OS/other apps.
      *
@@ -657,10 +643,23 @@ namespace dxvk {
     auto* importInfo = static_cast<const VkImportMemoryWin32HandleInfoKHR*>(
       findInChain(dedAllocInfo.pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR));
 
-    if (importInfo && importInfo->handle && m_pfnGetMemoryWin32HandleProperties) {
+    // vkGetMemoryWin32HandlePropertiesKHR is resolved here, only when an
+    // import is actually being processed, instead of being cached in a
+    // DxvkMemoryAllocator member: imports (shared D3D11 resources) are rare,
+    // and vkGetDeviceProcAddr is cheap next to the vkAllocateMemory below.
+    // It also keeps this file self-contained, with no extra member needed
+    // in dxvk_memory.h.
+    PFN_vkGetMemoryWin32HandlePropertiesKHR pfnGetMemoryWin32HandleProperties = nullptr;
+
+    if (importInfo && importInfo->handle && m_device->extensions().khrExternalMemoryWin32) {
+      pfnGetMemoryWin32HandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
+        m_vkd->sym("vkGetMemoryWin32HandlePropertiesKHR"));
+    }
+
+    if (pfnGetMemoryWin32HandleProperties) {
       VkMemoryWin32HandlePropertiesKHR handleProperties = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
 
-      VkResult propStatus = m_pfnGetMemoryWin32HandleProperties(m_vkd->device(),
+      VkResult propStatus = pfnGetMemoryWin32HandleProperties(m_vkd->device(),
         importInfo->handleType, importInfo->handle, &handleProperties);
 
       if (propStatus == VK_SUCCESS) {
