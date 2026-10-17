@@ -267,7 +267,10 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 61> devExtensionList = {{
+    // The size is deduced from the initializer, so adding or removing an
+    // extension below can neither overflow the array (compile error) nor
+    // leave null entries behind (crash in enableExtensions).
+    DxvkExt* devExtensionList[] = {
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -333,7 +336,7 @@ namespace dxvk {
       &devExtensions.khrZeroInitializeWorkgroupMemory,
       &devExtensions.nvxBinaryImport,
       &devExtensions.nvxImageViewHandle,
-    }};
+    };
 
     // Only enable Cuda interop extensions in 64-bit builds in
     // order to avoid potential driver or address space issues.
@@ -371,8 +374,8 @@ namespace dxvk {
     DxvkNameSet extensionsEnabled;
 
     if (!m_deviceExtensions.enableExtensions(
-          devExtensionList.size(),
-          devExtensionList.data(),
+          std::size(devExtensionList),
+          devExtensionList,
           extensionsEnabled))
       throw DxvkError("DxvkAdapter: Failed to create device");
 
@@ -610,11 +613,9 @@ namespace dxvk {
       enabledFeatures.extRasterizationOrderAttachmentAccess.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extRasterizationOrderAttachmentAccess);
     }
 
-    if (devExtensions.extExternalMemoryAcquireUnmodified) {
-      enabledFeatures.extExternalMemoryAcquireUnmodified = m_deviceFeatures.extExternalMemoryAcquireUnmodified;
-      enabledFeatures.extExternalMemoryAcquireUnmodified.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_FEATURES_EXT;
-      enabledFeatures.extExternalMemoryAcquireUnmodified.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extExternalMemoryAcquireUnmodified);
-    }
+    // VK_EXT_external_memory_acquire_unmodified has no feature struct: it only
+    // adds VkExternalMemoryAcquireUnmodifiedEXT for barrier pNext chains, so
+    // enabling the extension by name (see devExtensionList) is all it needs.
 
     // Report the desired overallocation behaviour to the driver
     VkDeviceMemoryOverallocationCreateInfoAMD overallocInfo;
@@ -1062,11 +1063,6 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) {
       m_deviceFeatures.extRasterizationOrderAttachmentAccess.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT;
       m_deviceFeatures.extRasterizationOrderAttachmentAccess.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extRasterizationOrderAttachmentAccess);
-    }
-
-    if (m_deviceExtensions.supports(VK_EXT_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXTENSION_NAME)) {
-      m_deviceFeatures.extExternalMemoryAcquireUnmodified.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_FEATURES_EXT;
-      m_deviceFeatures.extExternalMemoryAcquireUnmodified.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extExternalMemoryAcquireUnmodified);
     }
 
     m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &m_deviceFeatures.core);
