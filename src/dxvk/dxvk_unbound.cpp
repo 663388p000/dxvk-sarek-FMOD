@@ -68,14 +68,20 @@ namespace dxvk {
                     | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
                     | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
                     | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
-                    | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
-                    | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+                    | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
     info.stages     = VK_PIPELINE_STAGE_TRANSFER_BIT
                     | dev->getShaderPipelineStages();
     info.access     = VK_ACCESS_UNIFORM_READ_BIT
                     | VK_ACCESS_SHADER_READ_BIT
                     | VK_ACCESS_SHADER_WRITE_BIT;
-    
+
+    // The transform feedback usage flag only exists if the extension
+    // is enabled; passing it to vkCreateBuffer otherwise is invalid
+    // usage and strict drivers reject the buffer, which would take
+    // the whole device down with it.
+    if (dev->extensions().extTransformFeedback)
+      info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+
     return dev->createBuffer(info,
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   }
@@ -153,7 +159,15 @@ namespace dxvk {
     result.view2D      = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_2D,         1);
     result.view2DArr   = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_2D_ARRAY,   1);
     result.viewCube    = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_CUBE,       6);
-    result.viewCubeArr = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6);
+
+    // Cube array views are only valid if the imageCubeArray feature is
+    // enabled. That is not the case for D3D11 feature levels below 10_1
+    // on a driver that validates view creation, so do not take device
+    // creation down with us here. getImageView falls back to the plain
+    // cube view, which is all a shader without the capability can use.
+    if (dev->features().core.features.imageCubeArray)
+      result.viewCubeArr = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6);
+
     result.view3D      = createImageView(dev, m_image3D, format, VK_IMAGE_VIEW_TYPE_3D,         1);
     return result;
   }
@@ -170,7 +184,9 @@ namespace dxvk {
       case VK_IMAGE_VIEW_TYPE_2D:         return views->view2D.ptr();
       case VK_IMAGE_VIEW_TYPE_2D_ARRAY:   return views->view2DArr.ptr();
       case VK_IMAGE_VIEW_TYPE_CUBE:       return views->viewCube.ptr();
-      case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return views->viewCubeArr.ptr();
+      case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return views->viewCubeArr != nullptr
+                                                 ? views->viewCubeArr.ptr()
+                                                 : views->viewCube.ptr();
       case VK_IMAGE_VIEW_TYPE_3D:         return views->view3D.ptr();
       default:                            return nullptr;
     }
