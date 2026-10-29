@@ -150,6 +150,12 @@ namespace dxvk {
     for (auto& counter : m_rawAllocated)
       counter = 0;
 
+    for (auto& counter : m_blockBytes)
+      counter = 0;
+
+    for (auto& counter : m_blockBytesLogged)
+      counter = 0;
+
     // NOTE: adjust the accessor names below (vki(), instance()->handle(),
     // adapter()->handle(), device->handle()) if they differ from the
     // ones used in your copy of dxvk_adapter.h / dxvk_device.h.
@@ -196,8 +202,21 @@ namespace dxvk {
     // allocation and vkGetPhysicalDeviceMemoryProperties2 are core and are
     // picked up automatically by VMA from vulkanApiVersion; no explicit
     // VMA_ALLOCATOR_CREATE_KHR_DEDICATED_ALLOCATION_BIT is needed.
-    VmaAllocatorCreateFlags allocatorFlags =
-        VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    VmaAllocatorCreateFlags allocatorFlags = 0;
+
+    // VMA only allows VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT if
+    // VK_EXT_memory_budget is supported *and was enabled when the device
+    // was created*. It used to be set unconditionally. On a device without
+    // the extension (the Mali "Wrapper" driver in the Far Cry 2 logs does
+    // not enable it) VMA would still chain a
+    // VkPhysicalDeviceMemoryBudgetPropertiesEXT into
+    // vkGetPhysicalDeviceMemoryProperties2 every few allocations and build
+    // its budget from whatever comes back for a struct the driver was never
+    // told to fill in. Without the bit VMA uses the heap size (already
+    // reduced by the limits below) with its documented 80 % rule instead,
+    // which is deterministic and never asks the driver about the extension.
+    if (m_device->extensions().extMemoryBudget)
+      allocatorFlags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 
     // Only ask VMA to use vkBind*Memory2 if both entry points actually
     // resolved; falls back to the always-available non-2 bind calls
@@ -246,7 +265,20 @@ namespace dxvk {
      * exactly the kind of random frame hitches and delayed texture
      * uploads this is meant to avoid — better to fail an allocation
      * cleanly (and fall back to a different memory type, see alloc())
-     * than to let the driver deal with an overcommitted heap. */
+     * than to let the driver deal with an overcommitted heap.
+     *
+     * dxvk.maxMemoryBudget (MiB, 0 = off) has been parsed into DxvkOptions
+     * all along, but nothing ever read it. It is applied below as an extra
+     * upper bound on every device-local heap. On a phone this is the knob
+     * that answers "is the crash a memory problem?": set it to e.g. 1024
+     * and see whether the failure turns from a silent kill into a logged
+     * "Memory allocation failed". Never below 64 MiB, so a typo cannot make
+     * every allocation fail. */
+    VkDeviceSize maxBudget = m_device->config().maxMemoryBudget;
+
+    if (maxBudget != 0)
+      maxBudget = std::max(maxBudget, VkDeviceSize(64ull << 20));
+
     for (uint32_t i = 0; i < m_memProps.memoryHeapCount; i++) {
       if (m_memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
         if (m_isUMA) {
@@ -262,6 +294,9 @@ namespace dxvk {
         } else {
           heapSizeLimits[i] = (95 * m_memProps.memoryHeaps[i].size) / 100; // discrete: 95%
         }
+
+        if (maxBudget != 0)
+          heapSizeLimits[i] = std::min(heapSizeLimits[i], maxBudget);
       }
     }
 
@@ -328,10 +363,20 @@ namespace dxvk {
     // we're telling it to assume it can rely on.
 #if VMA_VULKAN_VERSION >= 1003000
     if (vmaApiVersion >= VK_API_VERSION_1_3) {
-      vulkanFunctions.vkGetDeviceBufferMemoryRequirements =
-        reinterpret_cast<PFN_vkGetDeviceBufferMemoryRequirementsKHR>(m_vkd->sym("vkGetDeviceBufferMemoryRequirements"));
-      vulkanFunctions.vkGetDeviceImageMemoryRequirements =
-        reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirementsKHR>(m_vkd->sym("vkGetDeviceImageMemoryRequirements"));
+      auto pfnGetDeviceBufferMemReq = reinterpret_cast<PFN_vkGetDeviceBufferMemoryRequirementsKHR>(
+        m_vkd->sym("vkGetDeviceBufferMemoryRequirements"));
+      auto pfnGetDeviceImageMemReq = reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirementsKHR>(
+        m_vkd->sym("vkGetDeviceImageMemoryRequirements"));
+
+      if (pfnGetDeviceBufferMemReq && pfnGetDeviceImageMemReq) {
+        vulkanFunctions.vkGetDeviceBufferMemoryRequirements = pfnGetDeviceBufferMemReq;
+        vulkanFunctions.vkGetDeviceImageMemoryRequirements  = pfnGetDeviceImageMemReq;
+      } else {
+        // A driver (or wrapper layer) that reports 1.3 but does not export
+        // these two entry points: tell VMA to assume 1.2 instead of handing
+        // it null pointers it has been told it can rely on.
+        vmaApiVersion = VK_API_VERSION_1_2;
+      }
     }
 #endif
 
@@ -370,6 +415,30 @@ namespace dxvk {
     // sometimes, more-but-shorter beats fewer-but-longer.
     allocatorInfo.preferredLargeHeapBlockSize = 64ull << 20;
 
+    // Record what the allocator actually ended up with. Everything below
+    // that can go wrong on a phone (budget, limits, 32-bit address space)
+    // is decided by these numbers, and none of them used to be logged.
+    {
+      std::string heapInfo;
+
+      for (uint32_t i = 0; i < m_memProps.memoryHeapCount; i++) {
+        const VkDeviceSize limit = heapSizeLimits[i];
+
+        heapInfo += str::format("\n  Heap ", i, ": ",
+          (m_memProps.memoryHeaps[i].size >> 20), " MiB",
+          (m_memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? ", device-local" : "",
+          (limit == VK_WHOLE_SIZE) ? ", no limit" : str::format(", limit ", (limit >> 20), " MiB"));
+      }
+
+      Logger::info(str::format("DxvkMemoryAllocator: ",
+        m_isUMA ? "unified memory" : "discrete memory",
+        ", VK_EXT_memory_budget ", m_device->extensions().extMemoryBudget ? "on" : "off",
+        ", VMA API version ", VK_VERSION_MAJOR(vmaApiVersion), ".", VK_VERSION_MINOR(vmaApiVersion),
+        ", block size ", (allocatorInfo.preferredLargeHeapBlockSize >> 20), " MiB",
+        (maxBudget != 0) ? str::format(", dxvk.maxMemoryBudget ", (maxBudget >> 20), " MiB") : std::string(),
+        heapInfo));
+    }
+
     if (vmaCreateAllocator(&allocatorInfo, &m_vma) != VK_SUCCESS)
       throw DxvkError("DxvkMemoryAllocator: Failed to create VMA allocator");
   }
@@ -393,6 +462,8 @@ namespace dxvk {
           VkMemoryPropertyFlags             flags,
           DxvkMemoryFlags                   hints) {
     std::lock_guard<dxvk::mutex> lock(m_mutex);
+
+    m_lastAllocStatus = VK_SUCCESS;
 
     // Keep small allocations together to avoid fragmenting
     // chunks for larger resources with lots of small gaps,
@@ -460,6 +531,7 @@ namespace dxvk {
         "DxvkMemoryAllocator: Memory allocation failed",
         "\n  Size:      ", req->size,
         "\n  Alignment: ", req->alignment,
+        "\n  VkResult:  ", int(m_lastAllocStatus),
         "\n  Mem flags: ", "0x", std::hex, flags,
         "\n  Mem types: ", "0x", std::hex, req->memoryTypeBits));
 
@@ -605,8 +677,10 @@ namespace dxvk {
         req, &createInfo, &allocation, &allocationInfo);
     }
 
-    if (status != VK_SUCCESS)
+    if (status != VK_SUCCESS) {
+      m_lastAllocStatus = status;
       return DxvkMemory();
+    }
 
     return DxvkMemory(this, allocation,
       allocationInfo.deviceMemory, allocationInfo.offset,
@@ -734,6 +808,8 @@ namespace dxvk {
     VkResult allocStatus = m_vkd->vkAllocateMemory(m_vkd->device(), &allocInfo, nullptr, &memory);
 
     if (allocStatus != VK_SUCCESS) {
+      m_lastAllocStatus = allocStatus;
+
       // Also used to be silent; same reasoning as the memTypeIndex log
       // above -- this is the actual vkAllocateMemory call that fails
       // when Wine can't resolve the shared handle, so logging its
@@ -753,7 +829,10 @@ namespace dxvk {
     void* mapPtr = nullptr;
 
     if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-      if (m_vkd->vkMapMemory(m_vkd->device(), memory, 0, VK_WHOLE_SIZE, 0, &mapPtr) != VK_SUCCESS) {
+      VkResult mapStatus = m_vkd->vkMapMemory(m_vkd->device(), memory, 0, VK_WHOLE_SIZE, 0, &mapPtr);
+
+      if (mapStatus != VK_SUCCESS) {
+        m_lastAllocStatus = mapStatus;
         this->notifyRawFree(memTypeIndex, req->size);
         m_vkd->vkFreeMemory(m_vkd->device(), memory, nullptr);
         return DxvkMemory();
@@ -837,12 +916,33 @@ namespace dxvk {
   void DxvkMemoryAllocator::notifyMemoryAlloc(uint32_t memoryTypeIndex, VkDeviceSize size) {
     uint32_t heapIndex = m_memProps.memoryTypes[memoryTypeIndex].heapIndex;
     m_device->adapter()->notifyHeapMemoryAlloc(heapIndex, size);
+
+    // Progress log: one line each time the heap's total crosses another
+    // 128 MiB (high-water mark, so allocation churn around one level does
+    // not repeat itself), and one for every block of 64 MiB or more. A
+    // game that ends in a kill leaves nothing else behind, so this is what
+    // shows how much device memory DXVK held when it happened.
+    constexpr VkDeviceSize logStep   = 128ull << 20;
+    constexpr VkDeviceSize largeSize =  64ull << 20;
+
+    const VkDeviceSize total = m_blockBytes[heapIndex].fetch_add(size, std::memory_order_relaxed) + size;
+    VkDeviceSize logged      = m_blockBytesLogged[heapIndex].load(std::memory_order_relaxed);
+
+    const bool crossedStep = (total / logStep) > (logged / logStep)
+      && m_blockBytesLogged[heapIndex].compare_exchange_strong(logged, total, std::memory_order_relaxed);
+
+    if (crossedStep || size >= largeSize) {
+      Logger::info(str::format("DxvkMemoryAllocator: heap ", heapIndex, " holds ",
+        (total >> 20), " MiB in device memory blocks (new block ",
+        (size >> 20), " MiB, memory type ", memoryTypeIndex, ")"));
+    }
   }
 
 
   void DxvkMemoryAllocator::notifyMemoryFree(uint32_t memoryTypeIndex, VkDeviceSize size) {
     uint32_t heapIndex = m_memProps.memoryTypes[memoryTypeIndex].heapIndex;
     m_device->adapter()->notifyHeapMemoryFree(heapIndex, size);
+    m_blockBytes[heapIndex].fetch_sub(size, std::memory_order_relaxed);
   }
 
 
@@ -884,3 +984,4 @@ namespace dxvk {
   }
 
 }
+ 
