@@ -92,7 +92,19 @@ extern "C" {
         __uuidof(ID3D11Device),
         reinterpret_cast<void**>(ppDevice));
     } catch (const DxvkError& e) {
+      // Log the actual reason as well. Without it a failure anywhere in
+      // device creation (Vulkan device, unbound resources, command list,
+      // initial submit) looks identical in the log.
+      Logger::err(e.message());
       Logger::err("D3D11CoreCreateDevice: Failed to create D3D11 device");
+      return E_FAIL;
+    } catch (const std::bad_alloc&) {
+      // Running out of (host) memory used to leave this function as an
+      // uncaught C++ exception, i.e. std::terminate and a dead process.
+      Logger::err("D3D11CoreCreateDevice: Out of memory while creating the D3D11 device");
+      return E_OUTOFMEMORY;
+    } catch (const std::exception& e) {
+      Logger::err(str::format("D3D11CoreCreateDevice: Unexpected exception: ", e.what()));
       return E_FAIL;
     }
   }
