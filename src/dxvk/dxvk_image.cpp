@@ -56,10 +56,12 @@ namespace dxvk {
       formatList.pNext = &externalInfo;
     }
     
-    if (m_vkd->vkCreateImage(m_vkd->device(),
-          &info, nullptr, &m_image.image) != VK_SUCCESS) {
+    VkResult imageResult = m_vkd->vkCreateImage(m_vkd->device(),
+      &info, nullptr, &m_image.image);
+
+    if (imageResult != VK_SUCCESS) {
       throw DxvkError(str::format(
-        "DxvkImage: Failed to create image:",
+        "DxvkImage: Failed to create image (", imageResult, "):",
         "\n  Type:            ", info.imageType,
         "\n  Format:          ", info.format,
         "\n  Extent:          ", "(", info.extent.width,
@@ -316,8 +318,14 @@ namespace dxvk {
           uint32_t cubeCount = m_info.numLayers / 6;
         
           if (cubeCount > 0) {
-            this->createView(VK_IMAGE_VIEW_TYPE_CUBE,       6);
-            this->createView(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6 * cubeCount);
+            this->createView(VK_IMAGE_VIEW_TYPE_CUBE, 6);
+
+            // A cube array view is only valid if imageCubeArray is enabled.
+            // D3D11 below feature level 10_1 does not request that feature
+            // itself, and drivers that validate view creation fail the
+            // whole texture (or device) if we ask for the view anyway.
+            if (m_image->m_device->features().core.features.imageCubeArray)
+              this->createView(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6 * cubeCount);
           }
         }
       } break;
@@ -372,10 +380,12 @@ namespace dxvk {
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
     }
     
-    if (m_vkd->vkCreateImageView(m_vkd->device(),
-          &viewInfo, nullptr, &m_views[type]) != VK_SUCCESS) {
+    VkResult vr = m_vkd->vkCreateImageView(m_vkd->device(),
+      &viewInfo, nullptr, &m_views[type]);
+
+    if (vr != VK_SUCCESS) {
       throw DxvkError(str::format(
-        "DxvkImageView: Failed to create image view:"
+        "DxvkImageView: Failed to create image view (", vr, "):"
         "\n  View type:       ", viewInfo.viewType,
         "\n  View format:     ", viewInfo.format,
         "\n  Subresources:    ",
