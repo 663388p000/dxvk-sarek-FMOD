@@ -386,6 +386,23 @@ namespace dxvk {
     // Enable additional device features if supported
     enabledFeatures.extExtendedDynamicState.extendedDynamicState = m_deviceFeatures.extExtendedDynamicState.extendedDynamicState;
 
+    // DXVK creates cube array image views for every cube-compatible image
+    // (DxvkImageView) and for its unbound-resource dummies, no matter which
+    // API level the application asked for. D3D11 only requests the feature
+    // from feature level 10_1 up, so a 10_0 device (Far Cry 2, for example)
+    // would be asked for CUBE_ARRAY views without the feature being on,
+    // which strict drivers answer by failing device creation. Turning it on
+    // whenever the hardware has it costs nothing and matches what the D3D9
+    // path already does for "DXVK Meta".
+    if (m_deviceFeatures.core.features.imageCubeArray)
+      enabledFeatures.core.features.imageCubeArray = VK_TRUE;
+
+    // Upstream D3D11 always enables the extended storage image formats so
+    // typed UAVs such as R16G16_FLOAT or R8_UNORM are usable, but this
+    // tree's D3D11Device::GetDeviceFeatures never sets the feature.
+    if (m_deviceFeatures.core.features.shaderStorageImageExtendedFormats)
+      enabledFeatures.core.features.shaderStorageImageExtendedFormats = VK_TRUE;
+
     enabledFeatures.ext4444Formats.formatA4B4G4R4 = m_deviceFeatures.ext4444Formats.formatA4B4G4R4;
     enabledFeatures.ext4444Formats.formatA4R4G4B4 = m_deviceFeatures.ext4444Formats.formatA4R4G4B4;
 
@@ -660,6 +677,13 @@ namespace dxvk {
     if (devExtensions.amdMemoryOverallocationBehaviour)
       overallocInfo.pNext = std::exchange(info.pNext, &overallocInfo);
 
+    // Progress markers around the driver calls. Everything that is logged is
+    // flushed immediately now, so if the process dies inside vkCreateDevice
+    // (or while the device resources are set up below), the last line of the
+    // log says which of the steps it was.
+    Logger::info(str::format("DxvkAdapter: Creating Vulkan device (",
+      extensionNameList.count(), " extensions, ", queueInfos.size(), " queue family/families)"));
+
     VkDevice device = VK_NULL_HANDLE;
     VkResult vr = m_vki->vkCreateDevice(m_handle, &info, nullptr, &device);
 
@@ -685,13 +709,21 @@ namespace dxvk {
       vr = m_vki->vkCreateDevice(m_handle, &info, nullptr, &device);
     }
 
-    if (vr != VK_SUCCESS)
-      throw DxvkError("DxvkAdapter: Failed to create device");
+    if (vr != VK_SUCCESS) {
+      Logger::err(str::format("DxvkAdapter: vkCreateDevice failed with ", vr));
+      throw DxvkError(str::format("DxvkAdapter: Failed to create device (", vr, ")"));
+    }
+
+    Logger::info("DxvkAdapter: Vulkan device created, setting up DXVK device");
 
     Rc<DxvkDevice> result = new DxvkDevice(instance, this,
       new vk::DeviceFn(m_vki, true, device),
       devExtensions, enabledFeatures);
+
+    Logger::info("DxvkAdapter: DXVK device object created, initializing resources");
     result->initResources();
+
+    Logger::info("DxvkAdapter: Device ready");
     return result;
   }
 
