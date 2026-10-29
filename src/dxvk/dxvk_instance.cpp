@@ -11,7 +11,78 @@
 
 namespace dxvk {
 
+  namespace {
+
+    /**
+     * \brief DxvkInstance objects that are currently alive
+     *
+     * Every DXVK DLL (d3d9, dxgi, d3d11, ...) has its own copy of this list,
+     * since libdxvk is linked into each of them. Allocated on first use and
+     * never freed on purpose: a DxvkInstance that is still referenced when
+     * the DLL is unloaded must be able to remove itself from the list no
+     * matter in which order the module's statics are torn down.
+     */
+    struct LiveInstances {
+      dxvk::mutex                      mutex;
+      std::vector<const DxvkInstance*> list;
+    };
+
+    LiveInstances& liveInstances() {
+      static LiveInstances* s_liveInstances = new LiveInstances();
+      return *s_liveInstances;
+    }
+
+  }
+
+
   DxvkInstance::DxvkInstance() {
+    auto& live = liveInstances();
+
+    // Games call Direct3DCreate9 / CreateDXGIFactory over and over (adapter
+    // and display mode enumeration, capability probes, ...), and every one of
+    // those calls used to build a complete DxvkInstance of its own: a new
+    // Vulkan instance, a new physical device enumeration and a new set of
+    // DxvkAdapter objects. Far Cry 2 does this at least nine times in a row
+    // before it creates a single device (see its d3d9 log). On Android each
+    // of those instances goes through the Vulkan wrapper into the Mali
+    // driver, which does not hand its per-instance state back until
+    // vkDestroyInstance, and a game that never releases its interfaces never
+    // gets there. Instance, adapters, config and options are identical for
+    // every instance in the process, so while one DxvkInstance is alive, any
+    // further one just picks up its state instead of repeating all of that.
+    //
+    // DXVK_SHARE_INSTANCE=0 restores the old behaviour (one Vulkan instance
+    // per DxvkInstance).
+    //
+    // The lock is only held while the list is looked at or changed, never
+    // while an instance is being built, so nothing that runs during that
+    // (extension providers, the Vulkan loader, ...) can deadlock on it. Two
+    // threads that start at the same moment may both build an instance; the
+    // later ones then share the first one that finished.
+    if (env::getEnvVar("DXVK_SHARE_INSTANCE") != "0") {
+      std::lock_guard<dxvk::mutex> lock(live.mutex);
+
+      if (!live.list.empty()) {
+        const DxvkInstance* other = live.list.front();
+
+        wsi::init();
+
+        m_config       = other->m_config;
+        m_options      = other->m_options;
+        m_vkl          = other->m_vkl;
+        m_vki          = other->m_vki;
+        m_extensions   = other->m_extensions;
+        m_extProviders = other->m_extProviders;
+        m_adapters     = other->m_adapters;
+
+        Logger::info(str::format("DxvkInstance: Reusing the Vulkan instance created earlier (",
+          live.list.size() + 1, " DxvkInstance objects alive)"));
+
+        live.list.push_back(this);
+        return;
+      }
+    }
+
     Logger::info(str::format("Game: ", env::getExeName()));
     Logger::info(str::format("DXVK-Sarek: ", DXVK_VERSION));
 
@@ -50,10 +121,25 @@ namespace dxvk {
           provider->getDeviceExtensions(i));
       }
     }
+
+    // Only a fully constructed instance may be picked up by the next one
+    {
+      std::lock_guard<dxvk::mutex> lock(live.mutex);
+      live.list.push_back(this);
+    }
   }
 
 
   DxvkInstance::~DxvkInstance() {
+    {
+      auto& live = liveInstances();
+      std::lock_guard<dxvk::mutex> lock(live.mutex);
+
+      live.list.erase(
+        std::remove(live.list.begin(), live.list.end(), this),
+        live.list.end());
+    }
+
     wsi::quit();
   }
 
