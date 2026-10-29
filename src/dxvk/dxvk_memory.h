@@ -371,6 +371,24 @@ namespace dxvk {
     // DxvkAdapter::initHeapAllocInfo() for its own atomic array).
     std::array<std::atomic<VkDeviceSize>, VK_MAX_MEMORY_HEAPS> m_rawAllocated;
 
+    // Running total, per heap, of the bytes in VkDeviceMemory blocks that
+    // VMA has allocated (maintained from the device memory callbacks, so it
+    // costs nothing extra), and the total at which a progress line was last
+    // written to the log. Only used to log device memory growth: a log that
+    // ends in a crash or a kill then still shows how much device memory DXVK
+    // had allocated by that point, which is what tells a memory problem
+    // apart from everything else. Zeroed in the constructor body, see
+    // m_rawAllocated above.
+    std::array<std::atomic<VkDeviceSize>, VK_MAX_MEMORY_HEAPS> m_blockBytes;
+    std::array<std::atomic<VkDeviceSize>, VK_MAX_MEMORY_HEAPS> m_blockBytesLogged;
+
+    // VkResult of the most recent failed allocation attempt (VMA or raw),
+    // so that the final "Memory allocation failed" error can say *why* the
+    // allocation failed: OUT_OF_DEVICE_MEMORY, OUT_OF_HOST_MEMORY,
+    // MEMORY_MAP_FAILED (address space) and TOO_MANY_OBJECTS call for
+    // completely different fixes. Only touched under m_mutex.
+    VkResult m_lastAllocStatus = VK_SUCCESS;
+
     VmaPool findOrCreatePool(
             DxvkMemoryPoolCategory           category,
             uint32_t                         memTypeIndex);
