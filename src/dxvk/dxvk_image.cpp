@@ -3,9 +3,39 @@
 #include "dxvk_device.h"
 
 namespace dxvk {
-  
+
   std::atomic<uint64_t> DxvkImageView::s_cookie = { 0ull };
 
+  namespace {
+
+    // Set once a driver has shown that it cannot handle a chained
+    // VkImageFormatListCreateInfoKHR. The format list is optional, so
+    // subsequent image creations can omit it.
+    std::atomic<bool> s_formatListRejected = { false };
+
+    const char* describeImageResult(VkResult vr) {
+      switch (static_cast<int32_t>(vr)) {
+        case -1:             return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case -2:             return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case -3:             return "VK_ERROR_INITIALIZATION_FAILED";
+        case -4:             return "VK_ERROR_DEVICE_LOST";
+        case -8:             return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case -11:            return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case -13:            return "VK_ERROR_UNKNOWN";
+        case -1000072003:    return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
+        case -1000158000:    return "VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT";
+        case -1000338000:    return "VK_ERROR_COMPRESSION_EXHAUSTED_EXT";
+        default:             return "";
+      }
+    }
+
+    bool isUnrecoverableImageResult(VkResult vr) {
+      return vr == VK_ERROR_OUT_OF_HOST_MEMORY
+          || vr == VK_ERROR_OUT_OF_DEVICE_MEMORY
+          || vr == VK_ERROR_DEVICE_LOST;
+    }
+
+  }
 
   DxvkImage::DxvkImage(
     const DxvkDevice*           device,
@@ -21,16 +51,17 @@ namespace dxvk {
     m_info.viewFormats = m_viewFormats.data();
 
     // If defined, we should provide a format list, which
-    // allows some drivers to enable image compression
+    // allows some drivers to enable image compression.
+   // It is only chained below if it has entries.
     VkImageFormatListCreateInfoKHR formatList;
     formatList.sType           = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR;
     formatList.pNext           = nullptr;
     formatList.viewFormatCount = createInfo.viewFormatCount;
-    formatList.pViewFormats    = createInfo.viewFormats;
+    formatList.pViewFormats    = m_viewFormats.data();
     
     VkImageCreateInfo info;
     info.sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.pNext                 = &formatList;
+    info.pNext                 = nullptr;
     info.flags                 = createInfo.flags;
     info.imageType             = createInfo.type;
     info.format                = createInfo.format;
@@ -48,32 +79,80 @@ namespace dxvk {
     m_shared = canShareImage(info, createInfo.sharing);
 
     VkExternalMemoryImageCreateInfo externalInfo;
-    if (m_shared) {
-      externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-      externalInfo.pNext = nullptr;
-      externalInfo.handleTypes = createInfo.sharing.type;
+    externalInfo.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    externalInfo.pNext       = nullptr;
+    externalInfo.handleTypes = createInfo.sharing.type;
 
-      formatList.pNext = &externalInfo;
+    const bool formatListAvailable = m_device->extensions().khrImageFormatList;
+    const bool useFormatList =
+         formatListAvailable
+      && createInfo.viewFormatCount != 0
+      && createInfo.viewFormats != nullptr
+      && !s_formatListRejected.load();
+
+    auto linkChain = [&] (bool withFormatList) {
+      const void* head = nullptr;
+
+      if (m_shared)
+        head = &externalInfo;
+
+      if (withFormatList) {
+        formatList.pNext = head;
+        head = &formatList;
+      }
+
+      info.pNext = head;
+    };
+
+    linkChain(useFormatList);
+
+    VkResult imageResult = m_vkd->vkCreateImage(
+      m_vkd->device(), &info, nullptr, &m_image.image);
+
+    // The format list is an optional optimization. If a driver rejects it,
+    // retry once without the list and remember that result for this process.
+    bool formatListInUse = useFormatList;
+
+    if (imageResult != VK_SUCCESS
+     && useFormatList
+     && !isUnrecoverableImageResult(imageResult)) {
+      const VkResult firstResult = imageResult;
+
+      formatListInUse = false;
+      linkChain(false);
+      imageResult = m_vkd->vkCreateImage(
+        m_vkd->device(), &info, nullptr, &m_image.image);
+
+      if (imageResult == VK_SUCCESS
+       && !s_formatListRejected.exchange(true)) {
+        Logger::warn(str::format(
+          "DxvkImage: vkCreateImage returned ", firstResult, " ",
+          describeImageResult(firstResult),
+          " with a format list chained, but succeeded without it. "
+          "Leaving the format list out from now on."));
+      }
     }
-    
-    VkResult imageResult = m_vkd->vkCreateImage(m_vkd->device(),
-      &info, nullptr, &m_image.image);
 
     if (imageResult != VK_SUCCESS) {
       throw DxvkError(str::format(
-        "DxvkImage: Failed to create image (", imageResult, "):",
-        "\n  Type:            ", info.imageType,
-        "\n  Format:          ", info.format,
-        "\n  Extent:          ", "(", info.extent.width,
+        "DxvkImage: Failed to create image (", imageResult, " ",
+        describeImageResult(imageResult), "):",
+        "\\n  Type:            ", info.imageType,
+        "\\n  Format:          ", info.format,
+        "\\n  Flags:           ", info.flags,
+        "\\n  Extent:          ", "(", info.extent.width,
                                  ",", info.extent.height,
                                  ",", info.extent.depth, ")",
-        "\n  Mip levels:      ", info.mipLevels,
-        "\n  Array layers:    ", info.arrayLayers,
-        "\n  Samples:         ", info.samples,
-        "\n  Usage:           ", info.usage,
-        "\n  Tiling:          ", info.tiling));
+        "\\n  Mip levels:      ", info.mipLevels,
+        "\\n  Array layers:    ", info.arrayLayers,
+        "\\n  Samples:         ", info.samples,
+        "\\n  Usage:           ", info.usage,
+        "\\n  Tiling:          ", info.tiling,
+        "\\n  View formats:    ", createInfo.viewFormatCount,
+        formatListInUse ? " (format list chained)" : " (no format list chained)",
+        "\\n  Shared handle:   ", m_shared ? "yes" : "no"));
     }
-    
+
     // Get memory requirements for the image. We may enforce strict
     // alignment on non-linear images in order not to violate the
     // bufferImageGranularity limit, which may be greater than the
