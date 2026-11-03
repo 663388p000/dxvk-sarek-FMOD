@@ -292,7 +292,6 @@ namespace dxvk {
     DxvkExt extHostQueryReset                 = { VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME,                   DxvkExtMode::Optional };
     DxvkExt extImageCompressionControl        = { VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME,           DxvkExtMode::Optional };
     DxvkExt extImageCompressionControlSwapchain = { VK_EXT_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN_EXTENSION_NAME, DxvkExtMode::Optional };
-    DxvkExt extImageDrmFormatModifier         = { VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,           DxvkExtMode::Optional };
     DxvkExt extMemoryBudget                   = { VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,                      DxvkExtMode::Passive  };
     DxvkExt extMemoryPriority                 = { VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME,                    DxvkExtMode::Optional };
     DxvkExt extMultisampledRenderToSingleSampled = { VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME, DxvkExtMode::Optional };
