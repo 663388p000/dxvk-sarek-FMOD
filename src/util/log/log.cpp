@@ -90,6 +90,21 @@ namespace dxvk {
         if (m_fileStream)
           m_fileStream << adjusted;
       }
+
+      // The log file is a plain std::ofstream, i.e. block-buffered, and the
+      // std::endl above only flushes the temporary stringstream, never this
+      // file. If the process dies without running static destructors (a crash
+      // in the driver or in Wine, the Android low-memory killer, an abort()),
+      // everything still sitting in that buffer is lost - up to 4 KiB, which
+      // is exactly the part of the log that explains the crash. The d3d9 and
+      // d3d11 logs of a Far Cry 2 run both end on a 4096-byte buffer boundary
+      // for that reason, and an empty d3d10 log is the same thing: the file
+      // was created but its first lines never reached the disk.
+      //
+      // Flushing once per message (not per line) keeps this to one write()
+      // per Logger::info/warn/err call.
+      if (m_fileStream)
+        m_fileStream.flush();
     }
   }
 
