@@ -25,7 +25,11 @@ namespace dxvk {
     ctx->beginRecording(dev->createCommandList());
     
     this->clearBuffer(ctx, m_buffer);
-    this->clearImage(ctx, m_image1D);
+
+    // The 1D dummy is optional, see createImage
+    if (m_image1D != nullptr)
+      this->clearImage(ctx, m_image1D);
+
     this->clearImage(ctx, m_image2D);
     this->clearImage(ctx, m_image3D);
     
@@ -122,9 +126,65 @@ namespace dxvk {
     
     if (type == VK_IMAGE_TYPE_2D)
       info.flags       |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-    
-    return dev->createImage(info,
-      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    // A dummy image only stands in for a resource the game did not bind, so
+    // a driver that is picky about one combination of flags and usage must
+    // not be able to take the whole device down with it. Ask for everything
+    // first, exactly as before, and fall back to simpler variants only if
+    // the driver rejects that. The views on top of the image follow
+    // whatever was granted, see createImageView.
+    struct Variant {
+      const char*         what;
+      VkImageCreateFlags  dropFlags;
+      VkImageUsageFlags   dropUsage;
+    };
+
+    static const Variant variants[] = {
+      { "as requested",                              0,                                  0                          },
+      { "without STORAGE usage",                     0,                                  VK_IMAGE_USAGE_STORAGE_BIT },
+      { "without MUTABLE_FORMAT",                    VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, 0                          },
+      { "without MUTABLE_FORMAT and STORAGE usage",  VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, VK_IMAGE_USAGE_STORAGE_BIT },
+    };
+
+    const char* typeName = type == VK_IMAGE_TYPE_1D ? "1D"
+                         : type == VK_IMAGE_TYPE_2D ? "2D" : "3D";
+
+    std::string firstFailure;
+
+    for (const Variant& variant : variants) {
+      DxvkImageCreateInfo attempt = info;
+      attempt.flags &= ~variant.dropFlags;
+      attempt.usage &= ~variant.dropUsage;
+
+      try {
+        Rc<DxvkImage> image = dev->createImage(attempt,
+          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        if (!firstFailure.empty()) {
+          Logger::warn(str::format(
+            "DxvkUnboundResources: The driver rejected the ", typeName,
+            " dummy image as requested, using it ", variant.what, " instead"));
+        }
+
+        return image;
+      } catch (const DxvkError& e) {
+        if (firstFailure.empty())
+          firstFailure = e.message();
+      }
+    }
+
+    // Games rarely touch 1D resources, and createImageViews points the 1D
+    // slots at the 2D dummy if there is none. The other two are needed.
+    if (type == VK_IMAGE_TYPE_1D) {
+      Logger::warn(str::format(
+        "DxvkUnboundResources: No variant of the 1D dummy image could be created, ",
+        "unbound 1D slots will use the 2D dummy instead. First failure:\n",
+        firstFailure));
+
+      return nullptr;
+    }
+
+    throw DxvkError(std::move(firstFailure));
   }
   
   
@@ -134,11 +194,18 @@ namespace dxvk {
           VkFormat        format,
           VkImageViewType type,
           uint32_t        layers) {
+    // Normally the image has everything and this changes nothing. If the
+    // driver only accepted a reduced variant (see createImage), a view must
+    // not claim usage its image lacks, and may only use another format
+    // if the image was created as mutable-format.
+    const DxvkImageCreateInfo& imageInfo = image->info();
+
     DxvkImageViewCreateInfo info;
     info.type         = type;
-    info.format       = format;
-    info.usage        = VK_IMAGE_USAGE_SAMPLED_BIT
-                      | VK_IMAGE_USAGE_STORAGE_BIT;
+    info.format       = (imageInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
+                      ? format : imageInfo.format;
+    info.usage        = (VK_IMAGE_USAGE_SAMPLED_BIT
+                       | VK_IMAGE_USAGE_STORAGE_BIT) & imageInfo.usage;
     info.aspect       = VK_IMAGE_ASPECT_COLOR_BIT;
     info.minLevel     = 0;
     info.numLevels    = 1;
@@ -154,8 +221,12 @@ namespace dxvk {
   
   DxvkUnboundResources::UnboundViews DxvkUnboundResources::createImageViews(DxvkDevice* dev, VkFormat format) {
     UnboundViews result;
-    result.view1D      = createImageView(dev, m_image1D, format, VK_IMAGE_VIEW_TYPE_1D,         1);
-    result.view1DArr   = createImageView(dev, m_image1D, format, VK_IMAGE_VIEW_TYPE_1D_ARRAY,   1);
+
+    if (m_image1D != nullptr) {
+      result.view1D    = createImageView(dev, m_image1D, format, VK_IMAGE_VIEW_TYPE_1D,         1);
+      result.view1DArr = createImageView(dev, m_image1D, format, VK_IMAGE_VIEW_TYPE_1D_ARRAY,   1);
+    }
+
     result.view2D      = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_2D,         1);
     result.view2DArr   = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_2D_ARRAY,   1);
     result.viewCube    = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_CUBE,       6);
@@ -169,6 +240,15 @@ namespace dxvk {
       result.viewCubeArr = createImageView(dev, m_image2D, format, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6);
 
     result.view3D      = createImageView(dev, m_image3D, format, VK_IMAGE_VIEW_TYPE_3D,         1);
+
+    // No 1D dummy image, see createImage. The accessors never hand out
+    // a null view, so give the 1D slots the 2D views, which at least
+    // are valid objects that read as zero.
+    if (m_image1D == nullptr) {
+      result.view1D    = result.view2D;
+      result.view1DArr = result.view2DArr;
+    }
+
     return result;
   }
 
