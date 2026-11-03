@@ -287,7 +287,6 @@ namespace dxvk {
       &devExtensions.extHostQueryReset,
       &devExtensions.extImageCompressionControl,
       &devExtensions.extImageCompressionControlSwapchain,
-      &devExtensions.extImageDrmFormatModifier,
       &devExtensions.extMemoryBudget,
       &devExtensions.extMemoryPriority,
       &devExtensions.extMultisampledRenderToSingleSampled,
