@@ -7,6 +7,226 @@ namespace dxvk {
   std::atomic<uint64_t> DxvkImageView::s_cookie = { 0ull };
 
 
+  namespace {
+
+    // Set once a driver has shown that it cannot cope with a chained
+    // VkImageFormatListCreateInfo (see DxvkImage::DxvkImage). From then on
+    // the optional list is simply left out instead of failing every time.
+    std::atomic<bool> s_formatListRejected = { false };
+
+
+    // Readable name for the results vkCreateImage is known to return.
+    // The generic VkResult printer does not know the extension codes, and
+    // a bare -1000158000 in a log tells nobody anything.
+    const char* describeImageResult(VkResult vr) {
+      switch (static_cast<int32_t>(vr)) {
+        case -1:          return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case -2:          return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case -3:          return "VK_ERROR_INITIALIZATION_FAILED";
+        case -4:          return "VK_ERROR_DEVICE_LOST";
+        case -8:          return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case -11:         return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case -13:         return "VK_ERROR_UNKNOWN";
+        case -1000072003: return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
+        case -1000158000: return "VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT";
+        case -1000338000: return "VK_ERROR_COMPRESSION_EXHAUSTED_EXT";
+        default:          return "";
+      }
+    }
+
+
+    // Failures where creating the image again, in any form, cannot help.
+    bool isUnrecoverableImageResult(VkResult vr) {
+      return vr == VK_ERROR_OUT_OF_HOST_MEMORY
+          || vr == VK_ERROR_OUT_OF_DEVICE_MEMORY
+          || vr == VK_ERROR_DEVICE_LOST;
+    }
+
+
+    // Text for one cell of the probe table below.
+    std::string describeProbeResult(VkResult vr) {
+      if (vr == VK_SUCCESS)
+        return "OK";
+
+      return str::format(static_cast<int32_t>(vr), " ", describeImageResult(vr));
+    }
+
+
+    // Creates and immediately destroys a set of images that each differ from
+    // the failed request in one property, and logs what the driver says to
+    // every one of them, next to what it claims about the same combination
+    // in vkGetPhysicalDeviceImageFormatProperties. Nothing is bound or
+    // allocated, so this is cheap, and it runs once per process, only after
+    // an image could not be created at all. The table shows which property
+    // the driver objects to (usage, flags, type, tiling, format, size, a
+    // chained structure) or that it rejects every image, which a single
+    // "failed" line never can.
+    void probeImageCreation(
+      const DxvkDevice*         device,
+      const VkImageCreateInfo&  requested,
+            bool                formatListAvailable) {
+      static std::atomic<bool> s_probed = { false };
+
+      if (s_probed.exchange(true))
+        return;
+
+      const Rc<vk::DeviceFn> vkd     = device->vkd();
+      const Rc<DxvkAdapter>  adapter = device->adapter();
+
+      Logger::info("DxvkImage: Probing which image properties the driver rejects");
+      Logger::info("DxvkImage:   create = vkCreateImage, query = vkGetPhysicalDeviceImageFormatProperties");
+
+      auto attempt = [&] (const char* name, VkImageCreateInfo ci, const void* pNext) {
+        ci.pNext = pNext;
+
+        VkImage  image   = VK_NULL_HANDLE;
+        VkResult created = vkd->vkCreateImage(vkd->device(), &ci, nullptr, &image);
+
+        if (created == VK_SUCCESS)
+          vkd->vkDestroyImage(vkd->device(), image, nullptr);
+
+        // The capability query cannot see chained structures, so its
+        // column only means something for rows that have none.
+        std::string queried = "-";
+
+        if (pNext == nullptr) {
+          VkImageFormatProperties props = { };
+
+          queried = describeProbeResult(adapter->imageFormatProperties(
+            ci.format, ci.imageType, ci.tiling, ci.usage, ci.flags, props));
+        }
+
+        Logger::info(str::format("DxvkImage:   ", name,
+          ": create ", describeProbeResult(created), ", query ", queried));
+      };
+
+      // The failed request with one property changed
+      auto variant = [&] (const char* name, auto modify) {
+        VkImageCreateInfo ci = requested;
+        modify(ci);
+        attempt(name, ci, nullptr);
+      };
+
+      VkFormat requestedFormat = requested.format;
+
+      VkImageFormatListCreateInfoKHR emptyList;
+      emptyList.sType           = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR;
+      emptyList.pNext           = nullptr;
+      emptyList.viewFormatCount = 0;
+      emptyList.pViewFormats    = nullptr;
+
+      VkImageFormatListCreateInfoKHR singleList = emptyList;
+      singleList.viewFormatCount = 1;
+      singleList.pViewFormats    = &requestedFormat;
+
+      attempt("as requested", requested, nullptr);
+
+      if (formatListAvailable) {
+        attempt("as requested + empty format list", requested, &emptyList);
+        attempt("as requested + format list with one entry", requested, &singleList);
+      }
+
+      if (device->features().extImageCompressionControl.imageCompressionControl) {
+        VkImageCompressionControlEXT compression;
+        compression.sType                        = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT;
+        compression.pNext                        = nullptr;
+        compression.flags                        = VK_IMAGE_COMPRESSION_DISABLED_EXT;
+        compression.compressionControlPlaneCount = 0;
+        compression.pFixedRateFlags              = nullptr;
+
+        attempt("as requested + compression control DISABLED", requested, &compression);
+      }
+
+      const bool mutableFormat = (requested.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0;
+      const bool storageUsage  = (requested.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+
+      if (mutableFormat) {
+        variant("without MUTABLE_FORMAT", [] (VkImageCreateInfo& ci) {
+          ci.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        });
+      }
+
+      if (storageUsage) {
+        variant("without STORAGE usage", [] (VkImageCreateInfo& ci) {
+          ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+        });
+      }
+
+      if (mutableFormat && storageUsage) {
+        variant("without MUTABLE_FORMAT and without STORAGE usage", [] (VkImageCreateInfo& ci) {
+          ci.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+          ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+        });
+      }
+
+      variant("usage SAMPLED only, no flags", [] (VkImageCreateInfo& ci) {
+        ci.flags = 0;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      });
+
+      variant("usage TRANSFER_DST only, no flags", [] (VkImageCreateInfo& ci) {
+        ci.flags = 0;
+        ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      });
+
+      variant("usage STORAGE only, no flags", [] (VkImageCreateInfo& ci) {
+        ci.flags = 0;
+        ci.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+      });
+
+      if (requested.imageType == VK_IMAGE_TYPE_1D) {
+        variant("as a 2D image of height 1", [] (VkImageCreateInfo& ci) {
+          ci.imageType = VK_IMAGE_TYPE_2D;
+        });
+      }
+
+      if (requested.tiling == VK_IMAGE_TILING_OPTIMAL) {
+        variant("LINEAR tiling", [] (VkImageCreateInfo& ci) {
+          ci.tiling = VK_IMAGE_TILING_LINEAR;
+        });
+      }
+
+      variant("format R8G8B8A8_UNORM", [] (VkImageCreateInfo& ci) {
+        ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+      });
+
+      variant("format R32_SFLOAT", [] (VkImageCreateInfo& ci) {
+        ci.format = VK_FORMAT_R32_SFLOAT;
+      });
+
+      if (requested.extent.width == 1 && requested.extent.height == 1 && requested.extent.depth == 1) {
+        variant("width 64 instead of 1", [] (VkImageCreateInfo& ci) {
+          ci.extent.width = 64;
+        });
+      }
+
+      // What an ordinary game texture looks like, in 2D and in 1D
+      VkImageCreateInfo base = { };
+      base.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+      base.imageType     = VK_IMAGE_TYPE_2D;
+      base.format        = VK_FORMAT_R8G8B8A8_UNORM;
+      base.extent        = { 4, 4, 1 };
+      base.mipLevels     = 1;
+      base.arrayLayers   = 1;
+      base.samples       = VK_SAMPLE_COUNT_1_BIT;
+      base.tiling        = VK_IMAGE_TILING_OPTIMAL;
+      base.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      base.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+      base.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+      attempt("baseline: RGBA8 2D 4x4, SAMPLED|TRANSFER_DST", base, nullptr);
+
+      base.imageType = VK_IMAGE_TYPE_1D;
+      base.extent    = { 4, 1, 1 };
+
+      attempt("baseline: RGBA8 1D 4, SAMPLED|TRANSFER_DST", base, nullptr);
+
+      Logger::info("DxvkImage: Probe finished");
+    }
+
+  }
+
+
   DxvkImage::DxvkImage(
     const DxvkDevice*           device,
     const DxvkImageCreateInfo&  createInfo,
@@ -21,7 +241,8 @@ namespace dxvk {
     m_info.viewFormats = m_viewFormats.data();
 
     // If defined, we should provide a format list, which
-    // allows some drivers to enable image compression
+    // allows some drivers to enable image compression.
+    // It is only chained below if it has entries.
     VkImageFormatListCreateInfoKHR formatList;
     formatList.sType           = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR;
     formatList.pNext           = nullptr;
@@ -30,7 +251,7 @@ namespace dxvk {
     
     VkImageCreateInfo info;
     info.sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.pNext                 = &formatList;
+    info.pNext                 = nullptr;
     info.flags                 = createInfo.flags;
     info.imageType             = createInfo.type;
     info.format                = createInfo.format;
@@ -48,20 +269,84 @@ namespace dxvk {
     m_shared = canShareImage(info, createInfo.sharing);
 
     VkExternalMemoryImageCreateInfo externalInfo;
-    if (m_shared) {
-      externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-      externalInfo.pNext = nullptr;
-      externalInfo.handleTypes = createInfo.sharing.type;
+    externalInfo.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    externalInfo.pNext       = nullptr;
+    externalInfo.handleTypes = createInfo.sharing.type;
 
-      formatList.pNext = &externalInfo;
-    }
+    // The format list is a hint, not a requirement: it tells the driver
+    // which formats a mutable-format image will be viewed with so it can
+    // keep compression on. An empty list means the same as no list per
+    // spec, and upstream DXVK only chains the list if it has entries.
+    // This code used to chain it unconditionally, i.e. as an empty list on
+    // every image without view formats, which is not needed.
+    //
+    // Whether that matters to any driver is NOT established. On
+    // Wrapper(Mali-G57 MC2), driver 54.1.0, the first image DXVK creates
+    // (the 1x1 1D R32_UINT dummy for unbound slots: mutable flag, empty
+    // list) failed with -1000158000, which is
+    // VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT - but a stock
+    // DXVK 1.7.2 build, which chains no list at all, stopped at the same
+    // point of device creation on the same driver. So this is only the
+    // spec-neutral cleanup; probeImageCreation() records what the driver
+    // really objects to, and if a driver ever rejects a non-empty list,
+    // the retry below copes.
+    const bool formatListAvailable = m_device->extensions().khrImageFormatList;
+
+    const bool useFormatList = formatListAvailable
+      && createInfo.viewFormatCount != 0
+      && createInfo.viewFormats != nullptr
+      && !s_formatListRejected.load();
+
+    auto linkChain = [&] (bool withFormatList) {
+      const void* head = nullptr;
+
+      if (m_shared) {
+        externalInfo.pNext = head;
+        head = &externalInfo;
+      }
+
+      if (withFormatList) {
+        formatList.pNext = head;
+        head = &formatList;
+      }
+
+      info.pNext = head;
+    };
+
+    linkChain(useFormatList);
     
-    if (m_vkd->vkCreateImage(m_vkd->device(),
-          &info, nullptr, &m_image.image) != VK_SUCCESS) {
+    VkResult imageResult = m_vkd->vkCreateImage(m_vkd->device(),
+      &info, nullptr, &m_image.image);
+
+    // If the driver refuses an image that carried a format list, try again
+    // without it, since it only ever was an optimisation. Remember the
+    // outcome so that later images do not fail once before every success.
+    bool formatListInUse = useFormatList;
+
+    if (imageResult != VK_SUCCESS && useFormatList && !isUnrecoverableImageResult(imageResult)) {
+      const VkResult firstResult = imageResult;
+
+      formatListInUse = false;
+      linkChain(false);
+      imageResult = m_vkd->vkCreateImage(m_vkd->device(),
+        &info, nullptr, &m_image.image);
+
+      if (imageResult == VK_SUCCESS && !s_formatListRejected.exchange(true)) {
+        Logger::warn(str::format(
+          "DxvkImage: vkCreateImage returned ", firstResult, " ",
+          describeImageResult(firstResult), " with a format list chained, ",
+          "but succeeded without it. Leaving the format list out from now on."));
+      }
+    }
+
+    if (imageResult != VK_SUCCESS) {
+      probeImageCreation(m_device, info, formatListAvailable);
+
       throw DxvkError(str::format(
-        "DxvkImage: Failed to create image:",
+        "DxvkImage: Failed to create image (", imageResult, " ", describeImageResult(imageResult), "):",
         "\n  Type:            ", info.imageType,
         "\n  Format:          ", info.format,
+        "\n  Flags:           ", info.flags,
         "\n  Extent:          ", "(", info.extent.width,
                                  ",", info.extent.height,
                                  ",", info.extent.depth, ")",
@@ -69,7 +354,9 @@ namespace dxvk {
         "\n  Array layers:    ", info.arrayLayers,
         "\n  Samples:         ", info.samples,
         "\n  Usage:           ", info.usage,
-        "\n  Tiling:          ", info.tiling));
+        "\n  Tiling:          ", info.tiling,
+        "\n  View formats:    ", createInfo.viewFormatCount, formatListInUse ? " (format list chained)" : " (no format list chained)",
+        "\n  Shared handle:   ", m_shared ? "yes" : "no"));
     }
     
     // Get memory requirements for the image. We may enforce strict
@@ -107,17 +394,43 @@ namespace dxvk {
     }
 
 #ifdef _WIN32
-    VkImportMemoryWin32HandleInfoKHR importInfo;
-    if (m_shared && createInfo.sharing.mode == DxvkSharedHandleMode::Import) {
-      importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
-      importInfo.pNext = nullptr;
-      importInfo.handleType = createInfo.sharing.type;
-      importInfo.handle = createInfo.sharing.handle;
-      importInfo.name = nullptr;
-
-      dedMemoryAllocInfo.pNext = &importInfo;
-    }
+    VkImportMemoryWin32HandleInfoKHR importInfoWin32;
 #endif
+    VkImportMemoryFdInfoKHR importInfoFd;
+
+    if (m_shared && createInfo.sharing.mode == DxvkSharedHandleMode::Import) {
+      // Two distinct import mechanisms, chosen by sharing.type - a
+      // VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT / _DMA_BUF_BIT_EXT
+      // handle cannot be imported through VkImportMemoryWin32HandleInfoKHR
+      // (wrong struct for that handle type per spec), nor can a Win32
+      // handle be imported through VkImportMemoryFdInfoKHR - unlike the
+      // export side above, which is naturally generic (VkExportMemoryAllocateInfo
+      // just carries a handleTypes bitmask), the import side genuinely
+      // needs a different struct per handle kind.
+      bool useFd =
+           createInfo.sharing.type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+        || createInfo.sharing.type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+      if (useFd) {
+        importInfoFd.sType      = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+        importInfoFd.pNext      = nullptr;
+        importInfoFd.handleType = createInfo.sharing.type;
+        importInfoFd.fd         = createInfo.sharing.fd;
+
+        dedMemoryAllocInfo.pNext = &importInfoFd;
+      }
+#ifdef _WIN32
+      else {
+        importInfoWin32.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
+        importInfoWin32.pNext = nullptr;
+        importInfoWin32.handleType = createInfo.sharing.type;
+        importInfoWin32.handle = createInfo.sharing.handle;
+        importInfoWin32.name = nullptr;
+
+        dedMemoryAllocInfo.pNext = &importInfoWin32;
+      }
+#endif
+    }
 
     m_vkd->vkGetImageMemoryRequirements2(
       m_vkd->device(), &memReqInfo, &memReq);
@@ -181,8 +494,14 @@ namespace dxvk {
     if (sharingInfo.mode == DxvkSharedHandleMode::None)
       return false;
 
-    if (!m_device->extensions().khrExternalMemoryWin32) {
-      Logger::err("Failed to create shared resource: VK_KHR_EXTERNAL_MEMORY_WIN32 not supported");
+    bool haveWin32Path = m_device->extensions().khrExternalMemoryWin32;
+    bool haveFdPath     = m_device->extensions().khrExternalMemoryFd
+                       && (m_device->extensions().extExternalMemoryDmaBuf
+                        || sharingInfo.type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
+
+    if (!haveWin32Path && !haveFdPath) {
+      Logger::err("Failed to create shared resource: no supported external memory path "
+                   "(VK_KHR_external_memory_win32 / VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf)");
       return false;
     }
 
@@ -284,8 +603,14 @@ namespace dxvk {
           uint32_t cubeCount = m_info.numLayers / 6;
         
           if (cubeCount > 0) {
-            this->createView(VK_IMAGE_VIEW_TYPE_CUBE,       6);
-            this->createView(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6 * cubeCount);
+            this->createView(VK_IMAGE_VIEW_TYPE_CUBE, 6);
+
+            // A cube array view is only valid if imageCubeArray is enabled.
+            // D3D11 below feature level 10_1 does not request that feature
+            // itself, and drivers that validate view creation fail the
+            // whole texture (or device) if we ask for the view anyway.
+            if (m_image->m_device->features().core.features.imageCubeArray)
+              this->createView(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6 * cubeCount);
           }
         }
       } break;
@@ -340,10 +665,12 @@ namespace dxvk {
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
     }
     
-    if (m_vkd->vkCreateImageView(m_vkd->device(),
-          &viewInfo, nullptr, &m_views[type]) != VK_SUCCESS) {
+    VkResult vr = m_vkd->vkCreateImageView(m_vkd->device(),
+      &viewInfo, nullptr, &m_views[type]);
+
+    if (vr != VK_SUCCESS) {
       throw DxvkError(str::format(
-        "DxvkImageView: Failed to create image view:"
+        "DxvkImageView: Failed to create image view (", vr, "):"
         "\n  View type:       ", viewInfo.viewType,
         "\n  View format:     ", viewInfo.format,
         "\n  Subresources:    ",
