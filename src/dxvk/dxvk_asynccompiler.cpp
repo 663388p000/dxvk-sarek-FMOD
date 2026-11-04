@@ -29,21 +29,49 @@ namespace dxvk {
 
     m_compilerThreads.reserve(numWorkers);
 
-    for (uint32_t i = 0; i < numWorkers; i++)
-      m_compilerThreads.emplace_back([this] { this->runCompilerThread(); });
+    for (uint32_t i = 0; i < numWorkers; i++) {
+      // Creating a thread throws when the process is out of address space
+      // or threads. This is the constructor, so letting it escape would
+      // destroy m_compilerThreads with live threads in it, which
+      // std::terminate answers. Run with the threads that could be started.
+      try {
+        m_compilerThreads.emplace_back([this] { this->runCompilerThread(); });
+      } catch (const DxvkError& e) {
+        Logger::err(str::format("DXVK: Could not start async compiler thread ",
+          i + 1, " of ", numWorkers, ": ", e.message()));
+        break;
+      }
+    }
+
+    if (m_compilerThreads.empty())
+      Logger::err("DXVK: No async compiler thread could be started");
   }
 
 
   DxvkAsyncCompiler::~DxvkAsyncCompiler() {
+    this->stop();
+  }
+
+
+  void DxvkAsyncCompiler::stop() {
     {
       std::lock_guard<std::mutex> lock(m_compilerLock);
       m_compilerStop.store(true);
+
+      // Drop whatever is still queued instead of compiling it first. The
+      // entries hold raw pointers to pipeline objects, which are destroyed
+      // while this compiler is still being shut down.
+      std::queue<PipelineEntry>().swap(m_compilerQueue);
     }
 
     m_compilerCond.notify_all();
 
-    for (auto& thread : m_compilerThreads)
-      thread.join();
+    // dxvk::thread::join() throws when the thread was already joined, so
+    // only join the ones that still can be: stop() may run more than once.
+    for (auto& thread : m_compilerThreads) {
+      if (thread.joinable())
+        thread.join();
+    }
   }
 
 
@@ -53,6 +81,11 @@ namespace dxvk {
     const DxvkRenderPass*                renderPass) {
     {
       std::lock_guard<std::mutex> lock(m_compilerLock);
+
+      // Nothing is accepted once a stop was requested.
+      if (m_compilerStop.load())
+        return;
+
       m_compilerQueue.emplace(PipelineEntry{ pipeline, state, renderPass });
     }
 
@@ -64,7 +97,7 @@ namespace dxvk {
     env::setThreadName("dxvk-pcompiler");
 
     while (true) {
-      std::vector<PipelineEntry> tasks;
+      PipelineEntry entry;
 
       {
         std::unique_lock<std::mutex> lock(m_compilerLock);
@@ -73,20 +106,36 @@ namespace dxvk {
           return m_compilerStop.load() || !m_compilerQueue.empty();
         });
 
-        if (m_compilerStop.load() && m_compilerQueue.empty())
+        // A stop request ends the loop immediately, queued work or not.
+        // stop() already emptied the queue, and anything compiled after it
+        // could touch pipelines that are being destroyed.
+        if (m_compilerStop.load())
           break;
 
-        while (!m_compilerQueue.empty()) {
-          tasks.push_back(std::move(m_compilerQueue.front()));
-          m_compilerQueue.pop();
-        }
+        // Take ONE entry. This used to move the whole backlog into a
+        // local vector, so a single worker compiled everything serially
+        // while every other worker found an empty queue and sat idle.
+        entry = std::move(m_compilerQueue.front());
+        m_compilerQueue.pop();
       }
 
-      for (auto& entry : tasks) {
-        if (entry.pipeline && entry.renderPass) {
-          if (entry.pipeline->compilePipeline(entry.state, entry.renderPass))
-            entry.pipeline->writePipelineStateToCache(entry.state, entry.renderPass->format());
-        }
+      if (!entry.pipeline || !entry.renderPass)
+        continue;
+
+      // Compiling can throw (shader module or pipeline layout creation is
+      // allowed to fail with a DxvkError, allocations with std::bad_alloc),
+      // and nothing above this loop catches on a worker thread: an
+      // exception here would end in std::terminate and take the whole game
+      // down with it. One lost compile only means that draw stays skipped.
+      try {
+        if (entry.pipeline->compilePipeline(entry.state, entry.renderPass))
+          entry.pipeline->writePipelineStateToCache(entry.state, entry.renderPass->format());
+      } catch (const DxvkError& e) {
+        Logger::err(str::format("DXVK: async pipeline compile failed: ", e.message()));
+      } catch (const std::exception& e) {
+        Logger::err(str::format("DXVK: async pipeline compile failed: ", e.what()));
+      } catch (...) {
+        Logger::err("DXVK: async pipeline compile failed with an unknown exception");
       }
     }
   }
