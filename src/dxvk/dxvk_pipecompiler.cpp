@@ -93,6 +93,11 @@ namespace dxvk {
 
 
   DxvkPipelineCompiler::~DxvkPipelineCompiler() {
+    this->stop();
+  }
+
+
+  void DxvkPipelineCompiler::stop() {
     this->requestStop();
     this->joinAll();
   }
@@ -118,22 +123,48 @@ namespace dxvk {
   void DxvkPipelineCompiler::spawnWorkers(uint32_t count) {
     m_workers.reserve(count);
 
-    for (uint32_t i = 0; i < count; i++)
-      m_workers.emplace_back([this] { this->runCompilerThread(); });
+    for (uint32_t i = 0; i < count; i++) {
+      // Creating a thread throws when the process is out of address space
+      // or threads. This runs in the constructor, so letting it escape
+      // would destroy m_workers with live threads in it, which std::terminate
+      // answers. Run with the threads that could be started instead.
+      try {
+        m_workers.emplace_back([this] { this->runCompilerThread(); });
+      } catch (const DxvkError& e) {
+        Logger::err(str::format("DXVK: Could not start dyasync compiler thread ",
+          i + 1, " of ", count, ": ", e.message()));
+        break;
+      }
+    }
+
+    if (m_workers.empty())
+      Logger::err("DXVK: No dyasync compiler thread could be started");
   }
 
 
   void DxvkPipelineCompiler::requestStop() {
     { std::lock_guard<std::mutex> lock(m_mutex);
-      m_stop = true; }
+      m_stop = true;
+
+      // Whatever is still queued is dropped rather than compiled first.
+      // Workers used to drain both lanes (up to 4096 entries each) before
+      // they would exit, and the entries point at pipeline objects that
+      // are destroyed while the compiler is still shutting down.
+      m_liveQueue.clear();
+      m_backgroundQueue.clear();
+    }
 
     m_cond.notify_all();
   }
 
 
   void DxvkPipelineCompiler::joinAll() {
-    for (dxvk::thread& worker : m_workers)
-      worker.join();
+    // dxvk::thread::join() throws when the thread was already joined, so
+    // only join the ones that still can be: stop() may run more than once.
+    for (dxvk::thread& worker : m_workers) {
+      if (worker.joinable())
+        worker.join();
+    }
   }
 
 
@@ -148,6 +179,11 @@ namespace dxvk {
     std::deque<DxvkPipelineEntry>& queue = this->laneFor(entry.priority);
 
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    // Nothing is accepted once a stop was requested; the caller treats this
+    // like a full queue and keeps using the fallback pipeline.
+    if (m_stop)
+      return false;
 
     switch (queue.size() >= DYASYNC_QUEUE_CAPACITY) {
       case true:  return false;
@@ -186,6 +222,11 @@ namespace dxvk {
       return work_available(m_stop, m_liveQueue, m_backgroundQueue);
     });
 
+    // Once a stop was requested nothing may start any more: the entries
+    // reference pipelines that are about to be destroyed.
+    if (m_stop)
+      return false;
+
     return this->takeEntry(entry, prefer_background(pick));
   }
 
@@ -199,9 +240,23 @@ namespace dxvk {
 
 
   void DxvkPipelineCompiler::processEntry(const DxvkPipelineEntry& entry) {
-    switch (entry_is_valid(entry)) {
-      case true:  this->compileAndCache(entry); break;
-      case false: break;
+    if (!entry_is_valid(entry))
+      return;
+
+    // Compiling can throw (shader module or pipeline layout creation is
+    // allowed to fail with a DxvkError, allocations with std::bad_alloc).
+    // Nothing above this function catches on a worker thread, so an
+    // exception here would end in std::terminate and take the whole game
+    // down with it. Losing one background compile is harmless: the draw
+    // keeps using its fallback pipeline.
+    try {
+      this->compileAndCache(entry);
+    } catch (const DxvkError& e) {
+      Logger::err(str::format("DXVK: dyasync pipeline compile failed: ", e.message()));
+    } catch (const std::exception& e) {
+      Logger::err(str::format("DXVK: dyasync pipeline compile failed: ", e.what()));
+    } catch (...) {
+      Logger::err("DXVK: dyasync pipeline compile failed with an unknown exception");
     }
   }
 
