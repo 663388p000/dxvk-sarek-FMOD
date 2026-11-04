@@ -935,7 +935,20 @@ namespace dxvk {
         m_workerQueue.pop();
       }
 
-      compilePipelines(item);
+      // Compiling can throw (shader module or pipeline layout creation is
+      // allowed to fail with a DxvkError, allocations with std::bad_alloc),
+      // and nothing above this loop catches on a worker thread: one bad
+      // cache entry would end in std::terminate and take the game down.
+      // Skip the rest of this item and carry on with the next one.
+      try {
+        compilePipelines(item);
+      } catch (const DxvkError& e) {
+        Logger::err(str::format("DXVK: State cache: pipeline compile failed: ", e.message()));
+      } catch (const std::exception& e) {
+        Logger::err(str::format("DXVK: State cache: pipeline compile failed: ", e.what()));
+      } catch (...) {
+        Logger::err("DXVK: State cache: pipeline compile failed with an unknown exception");
+      }
     }
   }
 
