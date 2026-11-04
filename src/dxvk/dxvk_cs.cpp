@@ -196,6 +196,14 @@ namespace dxvk {
     } catch (const DxvkError& e) {
       Logger::err("Exception on CS thread!");
       Logger::err(e.message());
+    } catch (const std::exception& e) {
+      // Anything that is not a DxvkError (std::bad_alloc when the address
+      // space runs out, for one) used to leave this function uncaught and
+      // end in std::terminate without a single line in the log.
+      Logger::err("Exception on CS thread!");
+      Logger::err(e.what());
+    } catch (...) {
+      Logger::err("Exception on CS thread! (unknown type)");
     }
   }
   
