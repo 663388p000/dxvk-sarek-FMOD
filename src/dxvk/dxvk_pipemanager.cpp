@@ -74,7 +74,16 @@ namespace dxvk {
   }
 
 
-  DxvkPipelineManager::~DxvkPipelineManager() = default;
+  DxvkPipelineManager::~DxvkPipelineManager() {
+    // Members are destroyed in reverse declaration order, which means
+    // m_graphicsPipelines and m_computePipelines go before m_async and
+    // m_dyasync - and the compiler workers still hold raw pointers into
+    // those tables. DxvkDevice's destructor does stop the workers first,
+    // but it returns early during process detach, and it never runs at all
+    // when device creation fails half way through, so the manager cannot
+    // rely on that and stops them itself.
+    this->stopWorkerThreads();
+  }
 
 
   DxvkComputePipeline* DxvkPipelineManager::createComputePipeline(
@@ -133,10 +142,17 @@ namespace dxvk {
 
 
   void DxvkPipelineManager::stopWorkerThreads() const {
-    switch (m_stateCache != nullptr) {
-      case true:  m_stateCache->stopWorkerThreads(); break;
-      case false: break;
-    }
+    // The pipeline compilers go first: they call into the state cache
+    // (writePipelineStateToCache) while they finish their current entry.
+    // Both are no-ops when called a second time.
+    if (m_dyasync != nullptr)
+      m_dyasync->stop();
+
+    if (m_async != nullptr)
+      m_async->stop();
+
+    if (m_stateCache != nullptr)
+      m_stateCache->stopWorkerThreads();
   }
 
 }
