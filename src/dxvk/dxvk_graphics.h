@@ -242,18 +242,41 @@ namespace dxvk {
       std::atomic<uint8_t>    used     { 0 };
     };
 
-    static constexpr uint32_t InstanceMapSize    = 4096;
+    // Sizes of the lookup tables below. EVERY DxvkGraphicsPipeline carries
+    // its own copy of all of them, and an application creates one pipeline
+    // object per shader combination - thousands of them in a game like
+    // Far Cry 2 - so they must stay small. They used to be 4096 / 8192 /
+    // 2048 / 4096 entries, which made each pipeline object ~160 KiB in a
+    // 32-bit build (~272 KiB in a 64-bit one) before it held a single state
+    // variant. A few thousand pipelines were enough to use several hundred
+    // MiB of a 32-bit address space, which is a plausible cause of the
+    // "memory climbs, then the game suddenly dies" behaviour.
+    //
+    // A pipeline normally has a handful of state variants. The ones that do
+    // not fit into the tables are still found by walking m_pipelines (see
+    // m_instanceMapSaturated), so nothing depends on these sizes being
+    // large enough; they only decide how often the slower walk is needed.
+    // All sizes must be powers of two.
+    static constexpr uint32_t InstanceMapSize    = 128;
     static constexpr uint32_t InstanceMapMask    = InstanceMapSize - 1;
-    static constexpr uint32_t MaxProbeDistance    = 64;
-    static constexpr uint32_t OverflowMapSize    = 8192;
+    static constexpr uint32_t MaxProbeDistance   = 32;
+    static constexpr uint32_t OverflowMapSize    = 128;
     static constexpr uint32_t OverflowMapMask    = OverflowMapSize - 1;
-    static constexpr uint32_t OverflowProbeMax   = 128;
-    static constexpr uint32_t FallbackMapSize    = 2048;
+    static constexpr uint32_t OverflowProbeMax   = 32;
+    static constexpr uint32_t FallbackMapSize    = 64;
     static constexpr uint32_t FallbackMapMask    = FallbackMapSize - 1;
     static constexpr uint32_t FallbackProbeMax   = 16;
 
-    static constexpr uint32_t QueuedSetSize = 4096;
+    static constexpr uint32_t QueuedSetSize = 128;
     static constexpr uint32_t QueuedSetMask = QueuedSetSize - 1;
+
+    static_assert((InstanceMapSize & InstanceMapMask) == 0, "InstanceMapSize must be a power of two");
+    static_assert((OverflowMapSize & OverflowMapMask) == 0, "OverflowMapSize must be a power of two");
+    static_assert((FallbackMapSize & FallbackMapMask) == 0, "FallbackMapSize must be a power of two");
+    static_assert((QueuedSetSize   & QueuedSetMask)   == 0, "QueuedSetSize must be a power of two");
+    static_assert(MaxProbeDistance  <= InstanceMapSize, "probe distance exceeds the instance map");
+    static_assert(OverflowProbeMax  <= OverflowMapSize, "probe distance exceeds the overflow map");
+    static_assert(FallbackProbeMax  <= FallbackMapSize, "probe distance exceeds the fallback map");
 
     sync::List<DxvkGraphicsPipelineInstance>  m_pipelines;
 
@@ -261,6 +284,11 @@ namespace dxvk {
 
     std::array<LockFreeMapEntry,  InstanceMapSize>   m_instanceMap;
     std::atomic<bool>                                m_instanceMapOverflow { false };
+
+    // Set once an instance could not be placed in either table. From then
+    // on a miss in the tables is not authoritative and the lookup also
+    // walks m_pipelines, which always contains every instance.
+    std::atomic<bool>                                m_instanceMapSaturated { false };
 
     std::array<LockFreeMapEntry,  OverflowMapSize>   m_overflowMap;
     std::array<FallbackMapEntry,  FallbackMapSize>   m_fallbackMap;
@@ -294,7 +322,13 @@ namespace dxvk {
     VkPipeline findFallback(
       const DxvkRenderPass*                renderPass);
 
-    std::atomic<uint32_t>                          m_fallbackEvictCounter { 0 };
+    /**
+     * \brief Clears the "already queued" marks of a state vector
+     *
+     * \param [in] hash Hash from computeInstanceHash
+     */
+    void releaseQueuedSlots(
+            size_t                         hash);
 
     VkPipeline createPipeline(
       const DxvkGraphicsPipelineStateInfo& state,
