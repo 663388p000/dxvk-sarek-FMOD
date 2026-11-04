@@ -144,28 +144,56 @@ namespace dxvk {
   bool DxvkGraphicsPipeline::compilePipeline(
     const DxvkGraphicsPipelineStateInfo& state,
     const DxvkRenderPass*                renderPass) {
-    if (!this->validatePipelineState(state, false))
+    // This state vector stops waiting in a compiler queue as soon as we are
+    // done here. Releasing the mark only on the path that creates an
+    // instance used to leave it set forever whenever the instance already
+    // existed, and every stale mark takes a slot away from the (now small)
+    // per-pipeline set. Two cases keep the mark on purpose, as a negative
+    // cache: an invalid state vector, and one whose compilation threw. Both
+    // would otherwise be queued, rejected and logged again on every draw
+    // that uses them.
+    struct QueuedMark {
+      DxvkGraphicsPipeline* pipeline;
+      size_t                hash;
+      bool                  keep;
+
+      ~QueuedMark() {
+        if (!keep)
+          pipeline->releaseQueuedSlots(hash);
+      }
+    } mark = { this, computeInstanceHash(state, renderPass), false };
+
+    if (!this->validatePipelineState(state, false)) {
+      mark.keep = true;
       return false;
+    }
 
     if (this->findInstanceLockFree(state, renderPass) != nullptr)
       return false;
 
-    auto* instance = this->createInstance(state, renderPass);
-    bool result = (instance != nullptr);
+    // If createInstance throws, the mark stays set (see above).
+    mark.keep = true;
+    bool created = this->createInstance(state, renderPass) != nullptr;
+    mark.keep = false;
 
-    size_t h    = computeInstanceHash(state, renderPass);
-    uint32_t qs = uint32_t(h) & QueuedSetMask;
-    size_t current = m_queuedSet[qs].load(std::memory_order_acquire);
-    if (current == h)
-      m_queuedSet[qs].compare_exchange_strong(current, size_t(0),
-        std::memory_order_release, std::memory_order_relaxed);
+    return created;
+  }
+
+
+  void DxvkGraphicsPipeline::releaseQueuedSlots(
+          size_t                         hash) {
+    // Same two slots getPipelineHandle() picks when it marks a state
+    // vector as queued.
+    uint32_t qs  = uint32_t(hash) & QueuedSetMask;
     uint32_t qs2 = ((qs >> 7) ^ qs ^ 0x55u) & QueuedSetMask;
-    current = m_queuedSet[qs2].load(std::memory_order_acquire);
-    if (current == h)
-      m_queuedSet[qs2].compare_exchange_strong(current, size_t(0),
-        std::memory_order_release, std::memory_order_relaxed);
 
-    return result;
+    size_t current = hash;
+    m_queuedSet[qs].compare_exchange_strong(current, size_t(0),
+      std::memory_order_acq_rel, std::memory_order_relaxed);
+
+    current = hash;
+    m_queuedSet[qs2].compare_exchange_strong(current, size_t(0),
+      std::memory_order_acq_rel, std::memory_order_relaxed);
   }
 
 
@@ -222,7 +250,7 @@ namespace dxvk {
       size_t stored = m_overflowMap[slot].hash.load(std::memory_order_acquire);
 
       if (stored == 0)
-        return nullptr;
+        break;
 
       if (stored == h) {
         auto* inst = m_overflowMap[slot].instance.load(std::memory_order_acquire);
@@ -230,6 +258,14 @@ namespace dxvk {
           return inst;
       }
     }
+
+    // Both tables are small on purpose (see the size constants), so a
+    // pipeline with very many state variants can run out of probe slots.
+    // Instances that did not fit are reachable only through the list.
+    // Without this walk such a state would never be found again and a new
+    // VkPipeline would be compiled for it on every single request.
+    if (m_instanceMapSaturated.load(std::memory_order_acquire))
+      return this->findInstance(state, renderPass);
 
     return nullptr;
   }
@@ -287,6 +323,11 @@ namespace dxvk {
         return;
       }
     }
+
+    // No room in either table. The instance is already in m_pipelines, so
+    // it is not lost; lookups just have to know that the tables no longer
+    // tell the whole story.
+    m_instanceMapSaturated.store(true, std::memory_order_release);
   }
 
 
@@ -339,13 +380,12 @@ namespace dxvk {
           break;
         }
 
-        if (i == FallbackProbeMax - 1) {
-          uint32_t evictIdx = m_fallbackEvictCounter.fetch_add(1, std::memory_order_relaxed) % FallbackProbeMax;
-          size_t evictSlot = (base + evictIdx) & FallbackMapMask;
-          m_fallbackMap[evictSlot].key.store(key, std::memory_order_release);
-          m_fallbackMap[evictSlot].pipeline.store(pipeline, std::memory_order_release);
-          m_fallbackMap[evictSlot].used.store(1, std::memory_order_relaxed);
-        }
+        // A probe window that is full simply means this render pass gets
+        // no fallback pipeline, and the draw then compiles synchronously
+        // as it would without dyasync. The slots used to be taken over in
+        // place here, but key and pipeline are two separate atomics: a
+        // reader could pair the new key with the old pipeline and bind one
+        // that was built for different attachment formats.
       }
     }
 
