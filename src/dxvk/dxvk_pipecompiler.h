@@ -43,6 +43,17 @@ namespace dxvk {
       const DxvkRenderPass*                renderPass,
             DxvkPipelinePriority           priority);
 
+    /**
+     * \brief Stops the worker threads
+     *
+     * Discards everything that is still queued and waits for the workers to
+     * finish the entry they are on. Queue entries hold raw pointers to
+     * pipeline objects, so this has to happen before those are destroyed.
+     * Calling it more than once is fine, and nothing can be queued
+     * afterwards.
+     */
+    void stop();
+
   private:
 
     std::mutex                    m_mutex;
