@@ -1,5 +1,8 @@
 #include "thread.h"
 #include "util_likely.h"
+#include "util_string.h"
+
+#include "log/log.h"
 
 #include <atomic>
 
@@ -14,6 +17,24 @@ namespace dxvk::this_thread {
       ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress"));
 
     return RtlDllShutdownInProgress();
+  }
+
+
+  void reportUnhandledException() noexcept {
+    // We are inside a catch block, so the exception that is being handled
+    // can be thrown again here to find out what it is.
+    const uint32_t id = uint32_t(::GetCurrentThreadId());
+
+    try {
+      throw;
+    } catch (const DxvkError& e) {
+      Logger::err(str::format("DXVK: Unhandled DxvkError on worker thread ", id, ":"));
+      Logger::err(e.message());
+    } catch (const std::exception& e) {
+      Logger::err(str::format("DXVK: Unhandled exception on worker thread ", id, ": ", e.what()));
+    } catch (...) {
+      Logger::err(str::format("DXVK: Unhandled exception of unknown type on worker thread ", id));
+    }
   }
 
 }
