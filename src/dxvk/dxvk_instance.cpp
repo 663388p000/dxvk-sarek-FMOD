@@ -84,7 +84,12 @@ namespace dxvk {
     }
 
     Logger::info(str::format("Game: ", env::getExeName()));
-    Logger::info(str::format("DXVK-Sarek: ", DXVK_VERSION));
+    // The version string is the same for every build of this tree, and
+    // logs of one game have turned out to come from different DLLs (and
+    // from different bitness). Say which one wrote this log.
+    Logger::info(str::format("DXVK-Sarek: ", DXVK_VERSION,
+      " (", env::is32BitHostPlatform() ? "32" : "64", "-bit, built ",
+      __DATE__, " ", __TIME__, ")"));
 
     wsi::init();
 
