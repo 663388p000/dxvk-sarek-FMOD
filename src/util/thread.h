@@ -27,6 +27,17 @@ namespace dxvk {
   };
 
 #ifdef _WIN32
+  namespace this_thread {
+    /**
+     * \brief Logs the exception that is being handled
+     *
+     * Only valid inside a catch block. Writes the type and message of
+     * the exception to the DXVK log, see \c ThreadFn::threadProc.
+     */
+    void reportUnhandledException() noexcept;
+  }
+
+
   /**
    * \brief Thread helper class
    *
@@ -90,7 +101,21 @@ namespace dxvk {
 
     static DWORD WINAPI threadProc(void *arg) {
       auto thread = reinterpret_cast<ThreadFn*>(arg);
-      thread->m_proc();
+
+      try {
+        thread->m_proc();
+      } catch (...) {
+        // Nothing above this frame can handle the exception, so it ends in
+        // std::terminate, exactly as it did before, and the process dies
+        // without a word in the log. Many of DXVK's threads (shader
+        // compilers, the state cache, the submission queue) have no handler
+        // of their own, and the usual reason for an exception there on a
+        // 32-bit process is std::bad_alloc, which is worth knowing. Write
+        // down what it was and let it continue on its way.
+        this_thread::reportUnhandledException();
+        throw;
+      }
+
       thread->decRef();
       return 0;
     }
@@ -293,8 +318,11 @@ namespace dxvk {
     std::cv_status wait_until(std::unique_lock<dxvk::mutex>& lock, const std::chrono::time_point<Clock, Duration>& time) {
       auto now = Clock::now();
 
+      // The remaining time is time - now. This used to pass now - time,
+      // a negative duration, which SleepConditionVariableSRW reads as a
+      // timeout of about 49 days. Nothing calls this today.
       return (now < time)
-        ? wait_for(lock, now - time)
+        ? wait_for(lock, time - now)
         : std::cv_status::timeout;
     }
 
@@ -304,7 +332,7 @@ namespace dxvk {
         return true;
 
       auto now = Clock::now();
-      return now < time && wait_for(lock, now - time, pred);
+      return now < time && wait_for(lock, time - now, pred);
     }
 
     template<typename Rep, typename Period>
