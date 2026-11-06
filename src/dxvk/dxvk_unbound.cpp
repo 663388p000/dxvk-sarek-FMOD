@@ -149,27 +149,43 @@ namespace dxvk {
     const char* typeName = type == VK_IMAGE_TYPE_1D ? "1D"
                          : type == VK_IMAGE_TYPE_2D ? "2D" : "3D";
 
+    // The views use an all-zero swizzle, so the size of a dummy image is
+    // never visible to a shader apart from textureSize(). 1x1 is what has
+    // always been used and is tried first. Some drivers take a 1-texel
+    // image for a degenerate case of their own layout rules (pitch or tile
+    // alignment) and reject it with an error that has nothing to do with
+    // the image, so each variant is tried once more with a larger extent.
+    static const uint32_t extents[] = { 1, 16 };
+
     std::string firstFailure;
 
-    for (const Variant& variant : variants) {
-      DxvkImageCreateInfo attempt = info;
-      attempt.flags &= ~variant.dropFlags;
-      attempt.usage &= ~variant.dropUsage;
+    for (uint32_t extent : extents) {
+      for (const Variant& variant : variants) {
+        DxvkImageCreateInfo attempt = info;
+        attempt.flags &= ~variant.dropFlags;
+        attempt.usage &= ~variant.dropUsage;
+        attempt.extent = {
+          extent,
+          type == VK_IMAGE_TYPE_1D ? 1u : extent,
+          type == VK_IMAGE_TYPE_3D ? extent : 1u };
 
-      try {
-        Rc<DxvkImage> image = dev->createImage(attempt,
-          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        try {
+          Rc<DxvkImage> image = dev->createImage(attempt,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        if (!firstFailure.empty()) {
-          Logger::warn(str::format(
-            "DxvkUnboundResources: The driver rejected the ", typeName,
-            " dummy image as requested, using it ", variant.what, " instead"));
+          if (!firstFailure.empty()) {
+            Logger::warn(str::format(
+              "DxvkUnboundResources: The driver rejected the ", typeName,
+              " dummy image as requested, using it ", variant.what,
+              extent > 1 ? str::format(" and ", extent, " texels wide") : std::string(),
+              " instead"));
+          }
+
+          return image;
+        } catch (const DxvkError& e) {
+          if (firstFailure.empty())
+            firstFailure = e.message();
         }
-
-        return image;
-      } catch (const DxvkError& e) {
-        if (firstFailure.empty())
-          firstFailure = e.message();
       }
     }
 
